@@ -10,6 +10,7 @@ import {
   CheckCircle2,
   CreditCard,
   LayoutDashboard,
+  LogOut,
   Plus,
   RefreshCw,
   Settings,
@@ -17,11 +18,12 @@ import {
   TrendingDown,
   Wallet,
 } from 'lucide-react';
-import { api, formatMoney, urgencyMeta } from './api.js';
+import { api, formatMoney, getToken, setToken, setUnauthorizedHandler, urgencyMeta } from './api.js';
 import CalendarPanel from './components/CalendarPanel.jsx';
 import AiAssistantPanel from './components/AiAssistantPanel.jsx';
 import PayoffPlanner from './components/PayoffPlanner.jsx';
 import IncomeCashflowPanel from './components/IncomeCashflowPanel.jsx';
+import AuthScreen from './components/AuthScreen.jsx';
 
 const emptyDebtForm = {
   name: '',
@@ -38,6 +40,8 @@ const emptyDebtForm = {
 };
 
 export default function App() {
+  const [authChecking, setAuthChecking] = useState(true);
+  const [user, setUser] = useState(null);
   const [tab, setTab] = useState('overview');
   const [dashboard, setDashboard] = useState(null);
   const [reminders, setReminders] = useState([]);
@@ -55,6 +59,48 @@ export default function App() {
   const notifiedIds = useRef(new Set());
 
   const showNotice = (text, kind = 'success') => setNotice({ text, kind });
+
+  const handleLogout = useCallback((message = '') => {
+    setToken('');
+    setUser(null);
+    setDashboard(null);
+    setReminders([]);
+    setPayments([]);
+    setLoading(true);
+    if (message) setNotice({ text: message, kind: 'error' });
+  }, []);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => {
+      handleLogout('Your session expired. Please sign in again.');
+    });
+    return () => setUnauthorizedHandler(null);
+  }, [handleLogout]);
+
+  useEffect(() => {
+    let active = true;
+    const token = getToken();
+    if (!token) {
+      setAuthChecking(false);
+      return undefined;
+    }
+    api('/auth/me')
+      .then((data) => {
+        if (active) setUser(data.user);
+      })
+      .catch(() => {
+        if (active) {
+          setToken('');
+          setUser(null);
+        }
+      })
+      .finally(() => {
+        if (active) setAuthChecking(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const fireBrowserNotifications = useCallback((unreadList, enabled) => {
     if (!enabled || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
@@ -92,10 +138,12 @@ export default function App() {
   }, [fireBrowserNotifications]);
 
   useEffect(() => {
+    if (!user) return undefined;
+    setLoading(true);
     loadAll();
     const timer = window.setInterval(loadAll, 60000);
     return () => window.clearInterval(timer);
-  }, [loadAll]);
+  }, [user, loadAll]);
 
   const requestNotifications = async () => {
     if (typeof Notification === 'undefined') {
@@ -173,6 +221,21 @@ export default function App() {
     }
   };
 
+  if (authChecking) {
+    return <div className="loading-screen">Checking session…</div>;
+  }
+
+  if (!user) {
+    return (
+      <AuthScreen
+        onAuthenticated={(authedUser, welcomeMsg) => {
+          setUser(authedUser);
+          if (welcomeMsg) showNotice(welcomeMsg, 'success');
+        }}
+      />
+    );
+  }
+
   if (loading || !dashboard) {
     return <div className="loading-screen">Loading DebtGuard AI…</div>;
   }
@@ -216,6 +279,10 @@ export default function App() {
           )}
           <button type="button" className="primary small" onClick={() => setFormModal({ mode: 'create', data: { ...emptyDebtForm } })}>
             <Plus size={15} /> Add Debt
+          </button>
+          <span className="user-pill" title={user.email}>{user.name}</span>
+          <button type="button" className="secondary small" onClick={() => handleLogout('')}>
+            <LogOut size={15} /> Sign Out
           </button>
         </div>
       </header>
@@ -311,9 +378,12 @@ export default function App() {
                               <td><span className={`badge ${meta.cls}`}>{meta.label}</span></td>
                               <td>{formatMoney(d.minimum_payment, currency)}</td>
                               <td><strong>{formatMoney(d.remaining_balance, currency)}</strong></td>
-                              <td>
+                              <td className="row-actions">
                                 <button type="button" className="mini-btn primary-tint" onClick={() => setPayModal({ debt: d, amount: String(d.minimum_payment || d.remaining_balance), paid_on: summary.today, note: '' })}>
                                   <CheckCircle2 size={14} /> Mark Paid
+                                </button>
+                                <button type="button" className="mini-btn danger-tint" title="Delete Debt" onClick={() => setDeleteTarget(d)}>
+                                  <Trash2 size={13} /> Delete
                                 </button>
                               </td>
                             </tr>

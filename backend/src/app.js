@@ -1,9 +1,25 @@
+import crypto from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import { advanceDueDate, enrichDebt, simulatePayoff, todayIsoDate } from './services/payoff.js';
 import { parseLeadDays, runReminderSweep } from './services/scheduler.js';
 import { analyzeCashflow, enrichIncome } from './services/cashflow.js';
-import { generateAssistantReply, parseNaturalLanguageDebt, parseNaturalLanguageIncome } from './services/ai.js';
+import {
+  generateAssistantReply,
+  parseNaturalLanguageCashUpdate,
+  parseNaturalLanguageDebt,
+  parseNaturalLanguageIncome,
+} from './services/ai.js';
+import {
+  generateOtp,
+  hashOtp,
+  hashPassword,
+  sendOtpEmail,
+  signToken,
+  smtpConfigured,
+  verifyPassword,
+  verifyToken,
+} from './services/auth.js';
 
 function validateIncomePayload(body, partial = false) {
   const name = body.name !== undefined ? String(body.name).trim() : undefined;
@@ -100,6 +116,39 @@ export function createApp(db, options = {}) {
   app.use(cors({ origin: corsOrigin === '*' ? '*' : corsOrigin.split(',').map((s) => s.trim()) }));
   app.use(express.json());
 
+  async function ensureUserSettings(userId, email = '') {
+    let settings = await db.queryOne('SELECT * FROM reminder_settings WHERE id = $1', [userId]);
+    if (!settings) {
+      await db.execute(
+        `INSERT INTO reminder_settings (id, lead_days, daily_cron, browser_notifications, email_enabled, reminder_email, preferred_strategy, currency, starting_cash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (id) DO NOTHING`,
+        [userId, '7,3,1,0', process.env.REMINDER_CRON || '0 9 * * *', true, false, email || '', 'avalanche', 'INR', 0]
+      );
+      settings = await db.queryOne('SELECT * FROM reminder_settings WHERE id = $1', [userId]);
+    }
+    return settings;
+  }
+
+  async function requireAuth(req, res, next) {
+    try {
+      const header = req.headers.authorization || '';
+      const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+      const decoded = verifyToken(token);
+      if (!decoded?.sub) {
+        return res.status(401).json({ error: 'Authentication required. Please sign in.' });
+      }
+      const user = await db.queryOne('SELECT id, name, email, created_at FROM users WHERE id = $1', [decoded.sub]);
+      if (!user) {
+        return res.status(401).json({ error: 'Session expired. Please sign in again.' });
+      }
+      req.user = user;
+      next();
+    } catch (err) {
+      next(err);
+    }
+  }
+
   app.get('/api/health', async (_req, res, next) => {
     try {
       await db.queryOne('SELECT 1 AS ok');
@@ -109,15 +158,202 @@ export function createApp(db, options = {}) {
     }
   });
 
-  app.get('/api/dashboard', async (_req, res, next) => {
+  app.get('/api/cron/reminders', async (req, res, next) => {
     try {
+      const secret = (process.env.CRON_SECRET || '').trim();
+      if (secret && req.headers.authorization !== `Bearer ${secret}`) {
+        return res.status(401).json({ error: 'Unauthorized cron request' });
+      }
+      const report = await runReminderSweep(db);
+      res.json({ ok: true, ...report });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/auth/register', async (req, res, next) => {
+    try {
+      const name = String(req.body?.name || '').trim();
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const password = String(req.body?.password || '');
+
+      if (!name) return res.status(400).json({ error: 'Full name is required' });
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: 'Please enter a valid email address' });
+      }
+      if (password.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters long' });
+      }
+
+      const existing = await db.queryOne('SELECT id FROM users WHERE email = $1', [email]);
+      if (existing) {
+        return res.status(409).json({ error: 'An account with this email already exists' });
+      }
+
+      const countRow = await db.queryOne('SELECT COUNT(*) AS count FROM users');
+      const isFirstUser = Number(countRow?.count || 0) === 0;
+
+      const userId = await db.insert(
+        'INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3)',
+        [name, email, hashPassword(password)]
+      );
+
+      if (isFirstUser) {
+        for (const table of ['debts', 'incomes', 'payments', 'reminders', 'chat_messages']) {
+          await db.execute(`UPDATE ${table} SET user_id = $1 WHERE user_id IS NULL`, [userId]);
+        }
+        if (userId !== 1) {
+          const defaultSettings = await db.queryOne('SELECT * FROM reminder_settings WHERE id = $1', [1]);
+          if (defaultSettings) {
+            await db.execute(
+              `INSERT INTO reminder_settings (id, lead_days, daily_cron, browser_notifications, email_enabled, reminder_email, preferred_strategy, currency, starting_cash)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+               ON CONFLICT (id) DO NOTHING`,
+              [
+                userId,
+                defaultSettings.lead_days,
+                defaultSettings.daily_cron,
+                Boolean(defaultSettings.browser_notifications),
+                Boolean(defaultSettings.email_enabled),
+                defaultSettings.reminder_email || email,
+                defaultSettings.preferred_strategy,
+                defaultSettings.currency,
+                Number(defaultSettings.starting_cash || 0),
+              ]
+            );
+          }
+        }
+      }
+
+      await ensureUserSettings(userId, email);
+      const user = { id: userId, name, email };
+      const token = signToken(user);
+      res.status(201).json({ token, user, claimed_legacy_data: isFirstUser });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/auth/login', async (req, res, next) => {
+    try {
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const password = String(req.body?.password || '');
+      if (!email || !password) {
+        return res.status(400).json({ error: 'Email and password are required' });
+      }
+      const user = await db.queryOne('SELECT id, name, email, password_hash FROM users WHERE email = $1', [email]);
+      if (!user || !verifyPassword(password, user.password_hash)) {
+        return res.status(401).json({ error: 'Invalid email or password' });
+      }
+      await ensureUserSettings(user.id, user.email);
+      const safeUser = { id: user.id, name: user.name, email: user.email };
+      res.json({ token: signToken(safeUser), user: safeUser });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/auth/forgot-password', async (req, res, next) => {
+    try {
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: 'Please enter a valid email address' });
+      }
+      if (!smtpConfigured(options.otpSender)) {
+        return res.status(503).json({
+          error: 'Google SMTP is not configured on the server yet. Add SMTP_USERNAME and SMTP_PASSWORD in Vercel environment settings.',
+        });
+      }
+
+      const user = await db.queryOne('SELECT id, name, email FROM users WHERE email = $1', [email]);
+      if (user) {
+        const nowIso = new Date().toISOString();
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+        await db.execute('UPDATE password_reset_otps SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL', [nowIso, user.id]);
+        const otp = generateOtp();
+        await db.insert(
+          `INSERT INTO password_reset_otps (user_id, otp_hash, attempts, expires_at, created_at)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [user.id, hashOtp(user.id, otp), 0, expiresAt, nowIso]
+        );
+        await sendOtpEmail(user.email, otp, 10, options.otpSender);
+      }
+
+      res.json({
+        message: 'If an account exists for this email, a 6-digit OTP has been sent. Please check your inbox and spam folder.',
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/auth/reset-password', async (req, res, next) => {
+    try {
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const otp = String(req.body?.otp || '').trim();
+      const newPassword = String(req.body?.new_password || '');
+
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: 'Please enter a valid email address' });
+      }
+      if (!/^\d{6}$/.test(otp)) {
+        return res.status(400).json({ error: 'Please enter the 6-digit OTP sent to your email' });
+      }
+      if (newPassword.length < 6) {
+        return res.status(400).json({ error: 'New password must be at least 6 characters long' });
+      }
+
+      const user = await db.queryOne('SELECT id, email FROM users WHERE email = $1', [email]);
+      if (!user) {
+        return res.status(400).json({ error: 'Invalid email or OTP' });
+      }
+
+      const otpRow = await db.queryOne(
+        'SELECT * FROM password_reset_otps WHERE user_id = $1 AND used_at IS NULL ORDER BY id DESC LIMIT 1',
+        [user.id]
+      );
+      if (!otpRow) {
+        return res.status(400).json({ error: 'No active OTP found. Please request a new reset code.' });
+      }
+      if (new Date(otpRow.expires_at).getTime() < Date.now()) {
+        return res.status(400).json({ error: 'This OTP has expired. Please request a new one.' });
+      }
+      if (Number(otpRow.attempts || 0) >= 5) {
+        return res.status(429).json({ error: 'Too many incorrect OTP attempts. Please request a new OTP.' });
+      }
+
+      const candidate = Buffer.from(hashOtp(user.id, otp), 'hex');
+      const stored = Buffer.from(otpRow.otp_hash, 'hex');
+      const matches = candidate.length === stored.length && crypto.timingSafeEqual(candidate, stored);
+      if (!matches) {
+        await db.execute('UPDATE password_reset_otps SET attempts = attempts + 1 WHERE id = $1', [otpRow.id]);
+        return res.status(400).json({ error: 'Invalid OTP code. Please check your email and try again.' });
+      }
+
+      await db.execute('UPDATE users SET password_hash = $1 WHERE id = $2', [hashPassword(newPassword), user.id]);
+      await db.execute('UPDATE password_reset_otps SET used_at = $1 WHERE id = $2', [new Date().toISOString(), otpRow.id]);
+      res.json({ message: 'Password reset successful. You can now sign in with your new password.' });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.use('/api', requireAuth);
+
+  app.get('/api/auth/me', (req, res) => {
+    res.json({ user: req.user });
+  });
+
+  app.get('/api/dashboard', async (req, res, next) => {
+    try {
+      const uid = req.user.id;
       const today = todayIsoDate();
-      const rawDebts = await db.query('SELECT * FROM debts ORDER BY next_due_date ASC, id DESC');
+      const rawDebts = await db.query('SELECT * FROM debts WHERE user_id = $1 ORDER BY next_due_date ASC, id DESC', [uid]);
       const debts = rawDebts.map((d) => enrichDebt(d, today));
-      const rawIncomes = await db.query('SELECT * FROM incomes ORDER BY expected_date ASC, id DESC');
+      const rawIncomes = await db.query('SELECT * FROM incomes WHERE user_id = $1 ORDER BY expected_date ASC, id DESC', [uid]);
       const incomes = rawIncomes.map((i) => enrichIncome(i, today));
       const active = debts.filter((d) => d.status === 'ACTIVE' && d.remaining_balance > 0);
-      const settings = await db.queryOne('SELECT * FROM reminder_settings WHERE id = $1', [1]);
+      const settings = await ensureUserSettings(uid, req.user.email);
       const cashflow = analyzeCashflow({
         debts: rawDebts,
         incomes: rawIncomes,
@@ -127,13 +363,15 @@ export function createApp(db, options = {}) {
         currency: settings?.currency || 'INR',
       });
       const unreadReminders = await db.query(
-        'SELECT * FROM reminders WHERE status = $1 ORDER BY sent_at DESC, id DESC LIMIT 20',
-        ['UNREAD']
+        'SELECT * FROM reminders WHERE status = $1 AND user_id = $2 ORDER BY sent_at DESC, id DESC LIMIT 20',
+        ['UNREAD', uid]
       );
       const recentPayments = await db.query(
         `SELECT p.*, d.name AS debt_name FROM payments p
          JOIN debts d ON d.id = p.debt_id
-         ORDER BY p.paid_on DESC, p.id DESC LIMIT 10`
+         WHERE d.user_id = $1
+         ORDER BY p.paid_on DESC, p.id DESC LIMIT 10`,
+        [uid]
       );
 
       const summary = {
@@ -174,10 +412,11 @@ export function createApp(db, options = {}) {
 
   app.get('/api/debts', async (req, res, next) => {
     try {
+      const uid = req.user.id;
       const { status } = req.query;
       const rows = status
-        ? await db.query('SELECT * FROM debts WHERE status = $1 ORDER BY next_due_date ASC', [String(status).toUpperCase()])
-        : await db.query('SELECT * FROM debts ORDER BY next_due_date ASC, id DESC');
+        ? await db.query('SELECT * FROM debts WHERE user_id = $1 AND status = $2 ORDER BY next_due_date ASC', [uid, String(status).toUpperCase()])
+        : await db.query('SELECT * FROM debts WHERE user_id = $1 ORDER BY next_due_date ASC, id DESC', [uid]);
       res.json({ debts: rows.map((d) => enrichDebt(d)) });
     } catch (err) {
       next(err);
@@ -186,14 +425,16 @@ export function createApp(db, options = {}) {
 
   app.post('/api/debts', async (req, res, next) => {
     try {
+      const uid = req.user.id;
       const parsed = validateDebtPayload(req.body || {}, false);
       if (parsed.error) return res.status(400).json({ error: parsed.error });
       const d = parsed.data;
 
       const id = await db.insert(
-        `INSERT INTO debts (name, lender, category, principal_amount, remaining_balance, interest_rate, minimum_payment, next_due_date, frequency, auto_pay, status, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        `INSERT INTO debts (user_id, name, lender, category, principal_amount, remaining_balance, interest_rate, minimum_payment, next_due_date, frequency, auto_pay, status, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
         [
+          uid,
           d.name,
           d.lender || '',
           d.category || 'LOAN',
@@ -209,8 +450,8 @@ export function createApp(db, options = {}) {
         ]
       );
 
-      await runReminderSweep(db);
-      const created = await db.queryOne('SELECT * FROM debts WHERE id = $1', [id]);
+      await runReminderSweep(db, todayIsoDate(), uid);
+      const created = await db.queryOne('SELECT * FROM debts WHERE id = $1 AND user_id = $2', [id, uid]);
       res.status(201).json({ debt: enrichDebt(created), message: 'Debt added to tracker' });
     } catch (err) {
       next(err);
@@ -219,8 +460,9 @@ export function createApp(db, options = {}) {
 
   app.put('/api/debts/:id', async (req, res, next) => {
     try {
+      const uid = req.user.id;
       const id = Number(req.params.id);
-      const existing = await db.queryOne('SELECT * FROM debts WHERE id = $1', [id]);
+      const existing = await db.queryOne('SELECT * FROM debts WHERE id = $1 AND user_id = $2', [id, uid]);
       if (!existing) return res.status(404).json({ error: 'Debt not found' });
 
       const parsed = validateDebtPayload(req.body || {}, true);
@@ -235,7 +477,7 @@ export function createApp(db, options = {}) {
          SET name = $1, lender = $2, category = $3, principal_amount = $4, remaining_balance = $5,
              interest_rate = $6, minimum_payment = $7, next_due_date = $8, frequency = $9,
              auto_pay = $10, status = $11, notes = $12, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $13`,
+         WHERE id = $13 AND user_id = $14`,
         [
           d.name ?? existing.name,
           d.lender ?? existing.lender,
@@ -250,11 +492,12 @@ export function createApp(db, options = {}) {
           status,
           d.notes ?? existing.notes,
           id,
+          uid,
         ]
       );
 
-      await runReminderSweep(db);
-      const updated = await db.queryOne('SELECT * FROM debts WHERE id = $1', [id]);
+      await runReminderSweep(db, todayIsoDate(), uid);
+      const updated = await db.queryOne('SELECT * FROM debts WHERE id = $1 AND user_id = $2', [id, uid]);
       res.json({ debt: enrichDebt(updated), message: 'Debt updated' });
     } catch (err) {
       next(err);
@@ -263,16 +506,17 @@ export function createApp(db, options = {}) {
 
   app.patch('/api/debts/:id/status', async (req, res, next) => {
     try {
+      const uid = req.user.id;
       const id = Number(req.params.id);
-      const existing = await db.queryOne('SELECT * FROM debts WHERE id = $1', [id]);
+      const existing = await db.queryOne('SELECT * FROM debts WHERE id = $1 AND user_id = $2', [id, uid]);
       if (!existing) return res.status(404).json({ error: 'Debt not found' });
 
       const nextStatus = String(req.body?.status || '').toUpperCase();
       if (!['ACTIVE', 'ARCHIVED', 'PAID_OFF'].includes(nextStatus)) {
         return res.status(400).json({ error: 'Status must be ACTIVE, ARCHIVED, or PAID_OFF' });
       }
-      await db.execute('UPDATE debts SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [nextStatus, id]);
-      const updated = await db.queryOne('SELECT * FROM debts WHERE id = $1', [id]);
+      await db.execute('UPDATE debts SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND user_id = $3', [nextStatus, id, uid]);
+      const updated = await db.queryOne('SELECT * FROM debts WHERE id = $1 AND user_id = $2', [id, uid]);
       res.json({ debt: enrichDebt(updated), message: `Debt status set to ${nextStatus}` });
     } catch (err) {
       next(err);
@@ -281,8 +525,9 @@ export function createApp(db, options = {}) {
 
   app.delete('/api/debts/:id', async (req, res, next) => {
     try {
+      const uid = req.user.id;
       const id = Number(req.params.id);
-      const result = await db.execute('DELETE FROM debts WHERE id = $1', [id]);
+      const result = await db.execute('DELETE FROM debts WHERE id = $1 AND user_id = $2', [id, uid]);
       if (!result.changes) return res.status(404).json({ error: 'Debt not found' });
       res.json({ message: 'Debt permanently deleted' });
     } catch (err) {
@@ -292,8 +537,9 @@ export function createApp(db, options = {}) {
 
   app.post('/api/debts/:id/pay', async (req, res, next) => {
     try {
+      const uid = req.user.id;
       const id = Number(req.params.id);
-      const debt = await db.queryOne('SELECT * FROM debts WHERE id = $1', [id]);
+      const debt = await db.queryOne('SELECT * FROM debts WHERE id = $1 AND user_id = $2', [id, uid]);
       if (!debt) return res.status(404).json({ error: 'Debt not found' });
 
       const amount = Number(req.body?.amount ?? debt.minimum_payment ?? debt.remaining_balance);
@@ -313,25 +559,25 @@ export function createApp(db, options = {}) {
           : advanceDueDate(debt.next_due_date, debt.frequency);
 
       await db.insert(
-        'INSERT INTO payments (debt_id, amount, paid_on, note) VALUES ($1, $2, $3, $4)',
-        [id, appliedAmount, paidOn, note]
+        'INSERT INTO payments (user_id, debt_id, amount, paid_on, note) VALUES ($1, $2, $3, $4, $5)',
+        [uid, id, appliedAmount, paidOn, note]
       );
 
       await db.execute(
         `UPDATE debts
          SET remaining_balance = $1, next_due_date = $2, status = $3, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $4`,
-        [newBalance, nextDueDate, newStatus, id]
+         WHERE id = $4 AND user_id = $5`,
+        [newBalance, nextDueDate, newStatus, id, uid]
       );
 
       // Acknowledge reminders belonging to the due date just paid
       await db.execute(
-        'UPDATE reminders SET status = $1 WHERE debt_id = $2 AND due_date = $3',
-        ['ACKNOWLEDGED', id, debt.next_due_date]
+        'UPDATE reminders SET status = $1 WHERE debt_id = $2 AND due_date = $3 AND user_id = $4',
+        ['ACKNOWLEDGED', id, debt.next_due_date, uid]
       );
 
-      await runReminderSweep(db);
-      const updated = await db.queryOne('SELECT * FROM debts WHERE id = $1', [id]);
+      await runReminderSweep(db, todayIsoDate(), uid);
+      const updated = await db.queryOne('SELECT * FROM debts WHERE id = $1 AND user_id = $2', [id, uid]);
       res.json({
         debt: enrichDebt(updated),
         payment: { debt_id: id, amount: appliedAmount, paid_on: paidOn },
@@ -342,13 +588,15 @@ export function createApp(db, options = {}) {
     }
   });
 
-  app.get('/api/payments', async (_req, res, next) => {
+  app.get('/api/payments', async (req, res, next) => {
     try {
       const payments = await db.query(
         `SELECT p.*, d.name AS debt_name, d.category
          FROM payments p
          JOIN debts d ON d.id = p.debt_id
-         ORDER BY p.paid_on DESC, p.id DESC LIMIT 100`
+         WHERE d.user_id = $1
+         ORDER BY p.paid_on DESC, p.id DESC LIMIT 100`,
+        [req.user.id]
       );
       res.json({ payments });
     } catch (err) {
@@ -360,7 +608,7 @@ export function createApp(db, options = {}) {
     try {
       const method = String(req.query.method || 'avalanche').toLowerCase() === 'snowball' ? 'snowball' : 'avalanche';
       const extra = Math.max(0, Number(req.query.extra || 0));
-      const debts = await db.query('SELECT * FROM debts WHERE status = $1 AND remaining_balance > 0', ['ACTIVE']);
+      const debts = await db.query('SELECT * FROM debts WHERE status = $1 AND remaining_balance > 0 AND user_id = $2', ['ACTIVE', req.user.id]);
 
       const selected = simulatePayoff(debts, method, extra);
       const alternative = simulatePayoff(debts, method === 'avalanche' ? 'snowball' : 'avalanche', extra);
@@ -378,14 +626,16 @@ export function createApp(db, options = {}) {
     }
   });
 
-  app.get('/api/reminders', async (_req, res, next) => {
+  app.get('/api/reminders', async (req, res, next) => {
     try {
       const reminders = await db.query(
         `SELECT r.*, d.name AS debt_name, d.remaining_balance, d.minimum_payment
          FROM reminders r
          JOIN debts d ON d.id = r.debt_id
+         WHERE d.user_id = $1
          ORDER BY CASE WHEN r.status = 'UNREAD' THEN 0 ELSE 1 END, r.sent_at DESC, r.id DESC
-         LIMIT 50`
+         LIMIT 50`,
+        [req.user.id]
       );
       res.json({ reminders });
     } catch (err) {
@@ -393,23 +643,10 @@ export function createApp(db, options = {}) {
     }
   });
 
-  app.post('/api/reminders/run', async (_req, res, next) => {
+  app.post('/api/reminders/run', async (req, res, next) => {
     try {
-      const report = await runReminderSweep(db);
+      const report = await runReminderSweep(db, todayIsoDate(), req.user.id);
       res.json(report);
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  app.get('/api/cron/reminders', async (req, res, next) => {
-    try {
-      const secret = (process.env.CRON_SECRET || '').trim();
-      if (secret && req.headers.authorization !== `Bearer ${secret}`) {
-        return res.status(401).json({ error: 'Unauthorized cron request' });
-      }
-      const report = await runReminderSweep(db);
-      res.json({ ok: true, ...report });
     } catch (err) {
       next(err);
     }
@@ -418,7 +655,7 @@ export function createApp(db, options = {}) {
   app.patch('/api/reminders/:id/ack', async (req, res, next) => {
     try {
       const id = Number(req.params.id);
-      const result = await db.execute('UPDATE reminders SET status = $1 WHERE id = $2', ['ACKNOWLEDGED', id]);
+      const result = await db.execute('UPDATE reminders SET status = $1 WHERE id = $2 AND user_id = $3', ['ACKNOWLEDGED', id, req.user.id]);
       if (!result.changes) return res.status(404).json({ error: 'Reminder not found' });
       res.json({ message: 'Reminder acknowledged' });
     } catch (err) {
@@ -426,21 +663,22 @@ export function createApp(db, options = {}) {
     }
   });
 
-  app.patch('/api/reminders/ack-all', async (_req, res, next) => {
+  app.patch('/api/reminders/ack-all', async (req, res, next) => {
     try {
-      const result = await db.execute('UPDATE reminders SET status = $1 WHERE status = $2', ['ACKNOWLEDGED', 'UNREAD']);
+      const result = await db.execute('UPDATE reminders SET status = $1 WHERE status = $2 AND user_id = $3', ['ACKNOWLEDGED', 'UNREAD', req.user.id]);
       res.json({ acknowledged: result.changes, message: 'All reminders marked as read' });
     } catch (err) {
       next(err);
     }
   });
 
-  app.get('/api/settings', async (_req, res, next) => {
+  app.get('/api/settings', async (req, res, next) => {
     try {
-      const settings = await db.queryOne('SELECT * FROM reminder_settings WHERE id = $1', [1]);
+      const settings = await ensureUserSettings(req.user.id, req.user.email);
       res.json({
         settings: {
           ...settings,
+          starting_cash: Number(settings.starting_cash || 0),
           browser_notifications: Boolean(settings.browser_notifications),
           email_enabled: Boolean(settings.email_enabled),
         },
@@ -452,7 +690,8 @@ export function createApp(db, options = {}) {
 
   app.put('/api/settings', async (req, res, next) => {
     try {
-      const current = await db.queryOne('SELECT * FROM reminder_settings WHERE id = $1', [1]);
+      const uid = req.user.id;
+      const current = await ensureUserSettings(uid, req.user.email);
       const body = req.body || {};
       const leadList = body.lead_days !== undefined ? parseLeadDays(body.lead_days) : parseLeadDays(current.lead_days);
       if (!leadList.length) {
@@ -476,13 +715,13 @@ export function createApp(db, options = {}) {
          SET lead_days = $1, daily_cron = $2, browser_notifications = $3, email_enabled = $4,
              reminder_email = $5, preferred_strategy = $6, currency = $7, starting_cash = $8, updated_at = CURRENT_TIMESTAMP
          WHERE id = $9`,
-        [leadDaysStr, dailyCron, browserNotifications, emailEnabled, reminderEmail, preferredStrategy, currency, startingCash, 1]
+        [leadDaysStr, dailyCron, browserNotifications, emailEnabled, reminderEmail, preferredStrategy, currency, startingCash, uid]
       );
 
       if (options.onCronChange && dailyCron !== current.daily_cron) {
         options.onCronChange(dailyCron);
       }
-      const updated = await db.queryOne('SELECT * FROM reminder_settings WHERE id = $1', [1]);
+      const updated = await ensureUserSettings(uid, req.user.email);
       res.json({
         settings: {
           ...updated,
@@ -499,20 +738,22 @@ export function createApp(db, options = {}) {
 
   app.put('/api/cash', async (req, res, next) => {
     try {
+      const uid = req.user.id;
+      await ensureUserSettings(uid, req.user.email);
       const cash = Number(req.body?.starting_cash);
       if (!Number.isFinite(cash) || cash < 0) {
         return res.status(400).json({ error: 'starting_cash must be a non-negative number' });
       }
-      await db.execute('UPDATE reminder_settings SET starting_cash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [cash, 1]);
+      await db.execute('UPDATE reminder_settings SET starting_cash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [cash, uid]);
       res.json({ starting_cash: cash, message: 'Available cash balance updated' });
     } catch (err) {
       next(err);
     }
   });
 
-  app.get('/api/incomes', async (_req, res, next) => {
+  app.get('/api/incomes', async (req, res, next) => {
     try {
-      const rows = await db.query('SELECT * FROM incomes ORDER BY expected_date ASC, id DESC');
+      const rows = await db.query('SELECT * FROM incomes WHERE user_id = $1 ORDER BY expected_date ASC, id DESC', [req.user.id]);
       res.json({ incomes: rows.map((i) => enrichIncome(i)) });
     } catch (err) {
       next(err);
@@ -521,13 +762,15 @@ export function createApp(db, options = {}) {
 
   app.post('/api/incomes', async (req, res, next) => {
     try {
+      const uid = req.user.id;
       const parsed = validateIncomePayload(req.body || {}, false);
       if (parsed.error) return res.status(400).json({ error: parsed.error });
       const d = parsed.data;
       const id = await db.insert(
-        `INSERT INTO incomes (name, source_type, amount, expected_date, frequency, reliability, status, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        `INSERT INTO incomes (user_id, name, source_type, amount, expected_date, frequency, reliability, status, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
         [
+          uid,
           d.name,
           d.source_type || 'BUSINESS',
           d.amount,
@@ -538,7 +781,7 @@ export function createApp(db, options = {}) {
           d.notes || '',
         ]
       );
-      const created = await db.queryOne('SELECT * FROM incomes WHERE id = $1', [id]);
+      const created = await db.queryOne('SELECT * FROM incomes WHERE id = $1 AND user_id = $2', [id, uid]);
       res.status(201).json({ income: enrichIncome(created), message: 'Income source added' });
     } catch (err) {
       next(err);
@@ -547,8 +790,9 @@ export function createApp(db, options = {}) {
 
   app.put('/api/incomes/:id', async (req, res, next) => {
     try {
+      const uid = req.user.id;
       const id = Number(req.params.id);
-      const existing = await db.queryOne('SELECT * FROM incomes WHERE id = $1', [id]);
+      const existing = await db.queryOne('SELECT * FROM incomes WHERE id = $1 AND user_id = $2', [id, uid]);
       if (!existing) return res.status(404).json({ error: 'Income source not found' });
       const parsed = validateIncomePayload(req.body || {}, true);
       if (parsed.error) return res.status(400).json({ error: parsed.error });
@@ -557,7 +801,7 @@ export function createApp(db, options = {}) {
         `UPDATE incomes
          SET name = $1, source_type = $2, amount = $3, expected_date = $4, frequency = $5,
              reliability = $6, notes = $7, updated_at = CURRENT_TIMESTAMP
-         WHERE id = $8`,
+         WHERE id = $8 AND user_id = $9`,
         [
           d.name ?? existing.name,
           d.source_type ?? existing.source_type,
@@ -567,9 +811,10 @@ export function createApp(db, options = {}) {
           d.reliability ?? existing.reliability,
           d.notes ?? existing.notes,
           id,
+          uid,
         ]
       );
-      const updated = await db.queryOne('SELECT * FROM incomes WHERE id = $1', [id]);
+      const updated = await db.queryOne('SELECT * FROM incomes WHERE id = $1 AND user_id = $2', [id, uid]);
       res.json({ income: enrichIncome(updated), message: 'Income source updated' });
     } catch (err) {
       next(err);
@@ -578,15 +823,16 @@ export function createApp(db, options = {}) {
 
   app.patch('/api/incomes/:id/status', async (req, res, next) => {
     try {
+      const uid = req.user.id;
       const id = Number(req.params.id);
-      const existing = await db.queryOne('SELECT * FROM incomes WHERE id = $1', [id]);
+      const existing = await db.queryOne('SELECT * FROM incomes WHERE id = $1 AND user_id = $2', [id, uid]);
       if (!existing) return res.status(404).json({ error: 'Income source not found' });
       const status = String(req.body?.status || '').toUpperCase();
       if (!['ACTIVE', 'PAUSED', 'RECEIVED', 'ARCHIVED'].includes(status)) {
         return res.status(400).json({ error: 'Invalid income status' });
       }
-      await db.execute('UPDATE incomes SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [status, id]);
-      const updated = await db.queryOne('SELECT * FROM incomes WHERE id = $1', [id]);
+      await db.execute('UPDATE incomes SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND user_id = $3', [status, id, uid]);
+      const updated = await db.queryOne('SELECT * FROM incomes WHERE id = $1 AND user_id = $2', [id, uid]);
       res.json({ income: enrichIncome(updated), message: `Income status set to ${status}` });
     } catch (err) {
       next(err);
@@ -595,8 +841,9 @@ export function createApp(db, options = {}) {
 
   app.post('/api/incomes/:id/receive', async (req, res, next) => {
     try {
+      const uid = req.user.id;
       const id = Number(req.params.id);
-      const existing = await db.queryOne('SELECT * FROM incomes WHERE id = $1', [id]);
+      const existing = await db.queryOne('SELECT * FROM incomes WHERE id = $1 AND user_id = $2', [id, uid]);
       if (!existing) return res.status(404).json({ error: 'Income source not found' });
 
       const receivedAmount = req.body?.amount !== undefined ? Number(req.body.amount) : Number(existing.amount);
@@ -606,16 +853,16 @@ export function createApp(db, options = {}) {
 
       const addToCash = req.body?.add_to_cash !== false;
       if (addToCash) {
-        const settings = await db.queryOne('SELECT starting_cash FROM reminder_settings WHERE id = $1', [1]);
+        const settings = await ensureUserSettings(uid, req.user.email);
         const newCash = Math.round((Number(settings?.starting_cash || 0) + receivedAmount) * 100) / 100;
-        await db.execute('UPDATE reminder_settings SET starting_cash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [newCash, 1]);
+        await db.execute('UPDATE reminder_settings SET starting_cash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [newCash, uid]);
       }
 
       const nextStatus = existing.frequency === 'ONE_TIME' ? 'RECEIVED' : 'ACTIVE';
       const nextDate = existing.frequency === 'ONE_TIME' ? existing.expected_date : advanceDueDate(existing.expected_date, existing.frequency);
-      await db.execute('UPDATE incomes SET expected_date = $1, status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3', [nextDate, nextStatus, id]);
+      await db.execute('UPDATE incomes SET expected_date = $1, status = $2, updated_at = CURRENT_TIMESTAMP WHERE id = $3 AND user_id = $4', [nextDate, nextStatus, id, uid]);
 
-      const updated = await db.queryOne('SELECT * FROM incomes WHERE id = $1', [id]);
+      const updated = await db.queryOne('SELECT * FROM incomes WHERE id = $1 AND user_id = $2', [id, uid]);
       res.json({
         income: enrichIncome(updated),
         message: nextStatus === 'RECEIVED' ? `${existing.name} marked received!` : `Recorded receipt. Next expected payout: ${nextDate}`,
@@ -628,7 +875,7 @@ export function createApp(db, options = {}) {
   app.delete('/api/incomes/:id', async (req, res, next) => {
     try {
       const id = Number(req.params.id);
-      const result = await db.execute('DELETE FROM incomes WHERE id = $1', [id]);
+      const result = await db.execute('DELETE FROM incomes WHERE id = $1 AND user_id = $2', [id, req.user.id]);
       if (!result.changes) return res.status(404).json({ error: 'Income source not found' });
       res.json({ message: 'Income source deleted' });
     } catch (err) {
@@ -638,10 +885,11 @@ export function createApp(db, options = {}) {
 
   app.get('/api/cashflow', async (req, res, next) => {
     try {
+      const uid = req.user.id;
       const days = Math.min(365, Math.max(7, Number(req.query.days || 30)));
-      const debts = await db.query('SELECT * FROM debts ORDER BY next_due_date ASC');
-      const incomes = await db.query('SELECT * FROM incomes ORDER BY expected_date ASC');
-      const settings = await db.queryOne('SELECT * FROM reminder_settings WHERE id = $1', [1]);
+      const debts = await db.query('SELECT * FROM debts WHERE user_id = $1 ORDER BY next_due_date ASC', [uid]);
+      const incomes = await db.query('SELECT * FROM incomes WHERE user_id = $1 ORDER BY expected_date ASC', [uid]);
+      const settings = await ensureUserSettings(uid, req.user.email);
       const cashflow = analyzeCashflow({
         debts,
         incomes,
@@ -655,18 +903,18 @@ export function createApp(db, options = {}) {
     }
   });
 
-  app.get('/api/ai/history', async (_req, res, next) => {
+  app.get('/api/ai/history', async (req, res, next) => {
     try {
-      const messages = await db.query('SELECT * FROM chat_messages ORDER BY id ASC LIMIT 60');
+      const messages = await db.query('SELECT * FROM chat_messages WHERE user_id = $1 ORDER BY id ASC LIMIT 60', [req.user.id]);
       res.json({ messages });
     } catch (err) {
       next(err);
     }
   });
 
-  app.delete('/api/ai/history', async (_req, res, next) => {
+  app.delete('/api/ai/history', async (req, res, next) => {
     try {
-      await db.execute('DELETE FROM chat_messages');
+      await db.execute('DELETE FROM chat_messages WHERE user_id = $1', [req.user.id]);
       res.json({ message: 'Chat history cleared' });
     } catch (err) {
       next(err);
@@ -675,18 +923,28 @@ export function createApp(db, options = {}) {
 
   app.post('/api/ai/chat', async (req, res, next) => {
     try {
+      const uid = req.user.id;
       const message = String(req.body?.message || '').trim();
       if (!message) return res.status(400).json({ error: 'Message is required' });
 
-      await db.insert('INSERT INTO chat_messages (role, content, metadata) VALUES ($1, $2, $3)', ['user', message, '{}']);
+      await ensureUserSettings(uid, req.user.email);
+      await db.insert('INSERT INTO chat_messages (user_id, role, content, metadata) VALUES ($1, $2, $3, $4)', [uid, 'user', message, '{}']);
 
-      const parsedIncome = parseNaturalLanguageIncome(message);
+      const parsedCash = parseNaturalLanguageCashUpdate(message);
+      let cashUpdated = null;
+      if (parsedCash) {
+        cashUpdated = parsedCash.starting_cash;
+        await db.execute('UPDATE reminder_settings SET starting_cash = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2', [cashUpdated, uid]);
+      }
+
+      const parsedIncome = cashUpdated !== null ? null : parseNaturalLanguageIncome(message);
       let createdIncome = null;
       if (parsedIncome) {
         const incId = await db.insert(
-          `INSERT INTO incomes (name, source_type, amount, expected_date, frequency, reliability, status, notes)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          `INSERT INTO incomes (user_id, name, source_type, amount, expected_date, frequency, reliability, status, notes)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
           [
+            uid,
             parsedIncome.name,
             parsedIncome.source_type,
             parsedIncome.amount,
@@ -697,16 +955,17 @@ export function createApp(db, options = {}) {
             parsedIncome.notes,
           ]
         );
-        createdIncome = await db.queryOne('SELECT * FROM incomes WHERE id = $1', [incId]);
+        createdIncome = await db.queryOne('SELECT * FROM incomes WHERE id = $1 AND user_id = $2', [incId, uid]);
       }
 
-      const parsedDebt = createdIncome ? null : parseNaturalLanguageDebt(message);
+      const parsedDebt = cashUpdated !== null || createdIncome ? null : parseNaturalLanguageDebt(message);
       let createdDebt = null;
       if (parsedDebt) {
         const newId = await db.insert(
-          `INSERT INTO debts (name, lender, category, principal_amount, remaining_balance, interest_rate, minimum_payment, next_due_date, frequency, auto_pay, status, notes)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+          `INSERT INTO debts (user_id, name, lender, category, principal_amount, remaining_balance, interest_rate, minimum_payment, next_due_date, frequency, auto_pay, status, notes)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
           [
+            uid,
             parsedDebt.name,
             parsedDebt.lender,
             parsedDebt.category,
@@ -721,18 +980,28 @@ export function createApp(db, options = {}) {
             parsedDebt.notes,
           ]
         );
-        createdDebt = await db.queryOne('SELECT * FROM debts WHERE id = $1', [newId]);
-        await runReminderSweep(db);
+        createdDebt = await db.queryOne('SELECT * FROM debts WHERE id = $1 AND user_id = $2', [newId, uid]);
+        await runReminderSweep(db, todayIsoDate(), uid);
       }
 
-      const debts = await db.query('SELECT * FROM debts ORDER BY next_due_date ASC');
-      const incomes = await db.query('SELECT * FROM incomes ORDER BY expected_date ASC');
-      const settings = await db.queryOne('SELECT * FROM reminder_settings WHERE id = $1', [1]);
-      const aiResult = await generateAssistantReply({ message, debts, incomes, settings, createdDebt, createdIncome });
+      const debts = await db.query('SELECT * FROM debts WHERE user_id = $1 ORDER BY next_due_date ASC', [uid]);
+      const incomes = await db.query('SELECT * FROM incomes WHERE user_id = $1 ORDER BY expected_date ASC', [uid]);
+      const settings = await ensureUserSettings(uid, req.user.email);
+      const aiResult = await generateAssistantReply({ message, debts, incomes, settings, createdDebt, createdIncome, cashUpdated });
 
       await db.insert(
-        'INSERT INTO chat_messages (role, content, metadata) VALUES ($1, $2, $3)',
-        ['assistant', aiResult.reply, JSON.stringify({ provider: aiResult.provider, created_debt_id: createdDebt?.id || null, created_income_id: createdIncome?.id || null })]
+        'INSERT INTO chat_messages (user_id, role, content, metadata) VALUES ($1, $2, $3, $4)',
+        [
+          uid,
+          'assistant',
+          aiResult.reply,
+          JSON.stringify({
+            provider: aiResult.provider,
+            created_debt_id: createdDebt?.id || null,
+            created_income_id: createdIncome?.id || null,
+            cash_updated: cashUpdated,
+          }),
+        ]
       );
 
       res.json({
@@ -740,6 +1009,7 @@ export function createApp(db, options = {}) {
         provider: aiResult.provider,
         created_debt: createdDebt ? enrichDebt(createdDebt) : null,
         created_income: createdIncome ? enrichIncome(createdIncome) : null,
+        cash_updated: cashUpdated,
       });
     } catch (err) {
       next(err);

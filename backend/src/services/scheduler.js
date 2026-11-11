@@ -53,18 +53,30 @@ async function sendEmailReminderIfConfigured(settings, createdReminders) {
   return true;
 }
 
-export async function runReminderSweep(db, referenceDate = todayIsoDate()) {
-  const settings = (await db.queryOne('SELECT * FROM reminder_settings WHERE id = $1', [1])) || {
-    lead_days: '7,3,1,0',
-    email_enabled: false,
-    reminder_email: '',
-    currency: 'INR',
+export async function runReminderSweep(db, referenceDate = todayIsoDate(), userId = null) {
+  const debts = userId
+    ? await db.query('SELECT * FROM debts WHERE status = $1 AND remaining_balance > 0 AND user_id = $2', ['ACTIVE', userId])
+    : await db.query('SELECT * FROM debts WHERE status = $1 AND remaining_balance > 0', ['ACTIVE']);
+
+  const settingsCache = new Map();
+  const getSettings = async (uid) => {
+    const key = uid || 1;
+    if (settingsCache.has(key)) return settingsCache.get(key);
+    const s = (await db.queryOne('SELECT * FROM reminder_settings WHERE id = $1', [key])) || {
+      lead_days: '7,3,1,0',
+      email_enabled: false,
+      reminder_email: '',
+      currency: 'INR',
+    };
+    settingsCache.set(key, s);
+    return s;
   };
-  const leadSet = new Set(parseLeadDays(settings.lead_days));
-  const debts = await db.query('SELECT * FROM debts WHERE status = $1 AND remaining_balance > 0', ['ACTIVE']);
 
   const created = [];
   for (const debt of debts) {
+    const uid = debt.user_id || userId || null;
+    const settings = await getSettings(uid);
+    const leadSet = new Set(parseLeadDays(settings.lead_days));
     const daysLeft = daysUntilDue(debt.next_due_date, referenceDate);
     const shouldTrigger = daysLeft < 0 || leadSet.has(daysLeft);
     if (!shouldTrigger) continue;
@@ -80,18 +92,27 @@ export async function runReminderSweep(db, referenceDate = todayIsoDate()) {
     const { title, message } = formatAlertCopy(debt, daysLeft, settings.currency);
     const channel = settings.email_enabled && settings.reminder_email ? 'IN_APP+EMAIL' : 'IN_APP';
     const id = await db.insert(
-      `INSERT INTO reminders (debt_id, due_date, days_before, channel, title, message, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [debt.id, debt.next_due_date, bucket, channel, title, message, 'UNREAD']
+      `INSERT INTO reminders (user_id, debt_id, due_date, days_before, channel, title, message, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [uid, debt.id, debt.next_due_date, bucket, channel, title, message, 'UNREAD']
     );
-    created.push({ id, debt_id: debt.id, due_date: debt.next_due_date, days_before: bucket, title, message, status: 'UNREAD' });
+    created.push({ id, user_id: uid, debt_id: debt.id, due_date: debt.next_due_date, days_before: bucket, title, message, status: 'UNREAD' });
   }
 
   let emailed = false;
-  try {
-    emailed = await sendEmailReminderIfConfigured(settings, created);
-  } catch (err) {
-    console.error('Reminder email delivery failed:', err.message);
+  const byUser = new Map();
+  for (const r of created) {
+    const k = r.user_id || 1;
+    if (!byUser.has(k)) byUser.set(k, []);
+    byUser.get(k).push(r);
+  }
+  for (const [uid, items] of byUser.entries()) {
+    try {
+      const settings = await getSettings(uid);
+      if (await sendEmailReminderIfConfigured(settings, items)) emailed = true;
+    } catch (err) {
+      console.error('Reminder email delivery failed:', err.message);
+    }
   }
 
   return { checked_debts: debts.length, created_count: created.length, created, emailed };

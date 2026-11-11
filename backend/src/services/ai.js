@@ -6,8 +6,10 @@ function formatMoney(amount, currency = 'INR') {
   return `${symbol}${Math.round(Number(amount || 0)).toLocaleString('en-IN')}`;
 }
 
+const MAX_REASONABLE_AMOUNT = 1_000_000_000_000;
+
 function extractAmountAndDate(text, referenceDate = todayIsoDate()) {
-  const amountMatches = [...text.matchAll(/(?:₹|\$|€|rs\.?|inr|usd)?\s*(\d[\d,]*(?:\.\d+)?)\s*(k|lakh|lakhs|l)?/gi)];
+  const amountMatches = [...text.matchAll(/(?:₹|\$|€|rs\.?|inr|usd)?\s*(\d[\d,]*(?:\.\d+)?)\s*(k|m|million|lakh|lakhs|l)?/gi)];
   let amount = 0;
   for (const m of amountMatches) {
     const idx = m.index || 0;
@@ -17,8 +19,9 @@ function extractAmountAndDate(text, referenceDate = todayIsoDate()) {
     let val = Number(m[1].replace(/,/g, ''));
     const unit = (m[2] || '').toLowerCase();
     if (unit === 'k') val *= 1000;
+    if (unit === 'm' || unit === 'million') val *= 1000000;
     if (unit === 'l' || unit.startsWith('lakh')) val *= 100000;
-    if (val > amount) amount = val;
+    if (Number.isFinite(val) && val <= MAX_REASONABLE_AMOUNT && val > amount) amount = val;
   }
 
   let dateStr = null;
@@ -44,8 +47,19 @@ function extractAmountAndDate(text, referenceDate = todayIsoDate()) {
   return { amount, dateStr, frequency };
 }
 
+export function parseNaturalLanguageCashUpdate(text) {
+  const lower = text.toLowerCase();
+  const cashContext = /\b(in my account|my balance|bank balance|cash on hand|cash balance|have in account|set cash|update cash)\b/.test(lower);
+  const debtKeyword = /\b(debt|loan|emi|credit card|card|owe|borrow)\b/.test(lower);
+  if (!cashContext || debtKeyword) return null;
+  const { amount } = extractAmountAndDate(text);
+  if (amount <= 0) return null;
+  return { starting_cash: amount };
+}
+
 export function parseNaturalLanguageIncome(text, referenceDate = todayIsoDate()) {
   const lower = text.toLowerCase();
+  if (/\b(in my account|my balance|bank balance|cash on hand|cash balance)\b/.test(lower)) return null;
   const hasIncomeKeyword = /\b(income|business|salary|payout|revenue|earning|client|rent|dividend|get money|receive money|receiving)\b/.test(lower);
   const addIntent = /\b(add|create|track|expecting|expect|get|receive|new)\b/.test(lower);
   if (!hasIncomeKeyword || !addIntent) return null;
@@ -60,7 +74,7 @@ export function parseNaturalLanguageIncome(text, referenceDate = todayIsoDate())
 
   const cleanedName = text
     .replace(/^(please\s+)?(add|create|track|i\s+get|i\s+receive|expecting)\s+(a|an|my|new)?\s*/i, '')
-    .replace(/(?:₹|\$|€|rs\.?)\s*\d[\d,]*(?:\.\d+)?\s*(k|lakhs?|l)?/gi, '')
+    .replace(/(?:₹|\$|€|rs\.?)\s*\d[\d,]*(?:\.\d+)?\s*(k|m|million|lakhs?|l)?/gi, '')
     .replace(/\b(?:from|on|due|every|weekly|biweekly|monthly|one-time|expected)\b.*$/i, '')
     .trim();
 
@@ -79,9 +93,10 @@ export function parseNaturalLanguageIncome(text, referenceDate = todayIsoDate())
 
 export function parseNaturalLanguageDebt(text, referenceDate = todayIsoDate()) {
   const lower = text.toLowerCase();
-  if (/\b(income|business|salary|payout|revenue|earning|get money|receive money)\b/.test(lower)) return null;
+  if (/\b(income|business|salary|payout|revenue|earning|get money|receive money|in my account|my balance|bank balance|cash)\b/.test(lower)) return null;
   const addIntent = /\b(add|create|track|remind me about|new debt|new loan|new card|new emi)\b/.test(lower);
-  if (!addIntent) return null;
+  const hasDebtTerm = /\b(debt|loan|emi|card|mortgage|owe|apr|interest|due)\b/.test(lower);
+  if (!addIntent || !hasDebtTerm) return null;
 
   const { amount: principal, dateStr: nextDueDate, frequency } = extractAmountAndDate(text, referenceDate);
   if (principal <= 0) return null;
@@ -182,8 +197,8 @@ function buildRuleBasedReply(message, debts, incomes, settings) {
     return lines.join('\n');
   }
 
-  const extraMatch = lower.match(/(?:extra|additional|more)\s*(?:₹|\$|€|rs\.?)?\s*(\d[\d,]*)/);
-  const extra = extraMatch ? Number(extraMatch[1].replace(/,/g, '')) : 2000;
+  const extraMatch = lower.match(/(?:(?:extra|additional|more)\s*(?:₹|\$|€|rs\.?)?\s*(\d[\d,]*)|(?:₹|\$|€|rs\.?)?\s*(\d[\d,]*)\s*(?:extra|additional|more))/i);
+  const extra = extraMatch ? Number((extraMatch[1] || extraMatch[2]).replace(/,/g, '')) : 2000;
   const avalanche = simulatePayoff(enriched, 'avalanche', extra);
   const snowball = simulatePayoff(enriched, 'snowball', extra);
 
@@ -249,8 +264,23 @@ async function callOpenAI(systemPrompt, userMessage) {
   return data.choices?.[0]?.message?.content || null;
 }
 
-export async function generateAssistantReply({ message, debts, incomes = [], settings, createdDebt = null, createdIncome = null }) {
+export async function generateAssistantReply({
+  message,
+  debts,
+  incomes = [],
+  settings,
+  createdDebt = null,
+  createdIncome = null,
+  cashUpdated = null,
+}) {
   const currency = settings?.currency || 'INR';
+  if (cashUpdated !== null && cashUpdated !== undefined) {
+    const cashflow = analyzeCashflow({ debts, incomes, startingCash: Number(cashUpdated), horizonDays: 30, currency });
+    return {
+      provider: 'built-in-parser',
+      reply: `✅ Updated your **Cash on Hand** to **${formatMoney(cashUpdated, currency)}**.\n\n${cashflow.overall_status === 'SUFFICIENT' ? '✅' : '⚠️'} **Updated 30-day Cashflow:** ${cashflow.headline}`,
+    };
+  }
   if (createdIncome) {
     const cashflow = analyzeCashflow({ debts, incomes, startingCash: settings?.starting_cash || 0, horizonDays: 30, currency });
     return {

@@ -10,6 +10,24 @@ const DEFAULT_SQLITE_PATH = path.resolve(__dirname, '../data/debts.db');
 const SQLITE_SCHEMA = `
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS password_reset_otps (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  otp_hash TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS debts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -92,6 +110,24 @@ CREATE INDEX IF NOT EXISTS ix_reminders_status ON reminders (status);
 `;
 
 const POSTGRES_SCHEMA = `
+CREATE TABLE IF NOT EXISTS users (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(140) NOT NULL,
+  email VARCHAR(160) NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS password_reset_otps (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  otp_hash VARCHAR(64) NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS debts (
   id SERIAL PRIMARY KEY,
   name VARCHAR(160) NOT NULL,
@@ -200,6 +236,9 @@ export function createDb(options = {}) {
       });
       await pgPool.query(POSTGRES_SCHEMA);
       await pgPool.query('ALTER TABLE reminder_settings ADD COLUMN IF NOT EXISTS starting_cash DOUBLE PRECISION NOT NULL DEFAULT 0');
+      for (const tbl of ['debts', 'incomes', 'payments', 'reminders', 'chat_messages']) {
+        await pgPool.query(`ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE`);
+      }
     } else {
       const dbPath = options.sqlitePath || process.env.SQLITE_PATH || (isVercelEphemeral ? '/tmp/debts.db' : DEFAULT_SQLITE_PATH);
       if (dbPath !== ':memory:') {
@@ -210,6 +249,12 @@ export function createDb(options = {}) {
       const cols = sqliteDb.prepare('PRAGMA table_info(reminder_settings)').all().map((c) => c.name);
       if (!cols.includes('starting_cash')) {
         sqliteDb.exec('ALTER TABLE reminder_settings ADD COLUMN starting_cash REAL NOT NULL DEFAULT 0');
+      }
+      for (const tbl of ['debts', 'incomes', 'payments', 'reminders', 'chat_messages']) {
+        const tblCols = sqliteDb.prepare(`PRAGMA table_info(${tbl})`).all().map((c) => c.name);
+        if (!tblCols.includes('user_id')) {
+          sqliteDb.exec(`ALTER TABLE ${tbl} ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE CASCADE`);
+        }
       }
     }
 

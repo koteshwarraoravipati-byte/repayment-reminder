@@ -1,15 +1,42 @@
 const API_BASE = (import.meta.env.VITE_API_URL || '/api').replace(/\/+$/, '');
+const TOKEN_KEY = 'debtguard_token';
+
+let unauthorizedHandler = null;
+
+export function getToken() {
+  try {
+    return window.localStorage.getItem(TOKEN_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function setToken(token) {
+  try {
+    if (token) window.localStorage.setItem(TOKEN_KEY, token);
+    else window.localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    // Ignore storage quota / privacy mode errors
+  }
+}
+
+export function setUnauthorizedHandler(fn) {
+  unauthorizedHandler = fn;
+}
 
 export async function api(path, options = {}) {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 15000);
+  const token = getToken();
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
   let res;
   try {
-    res = await fetch(`${API_BASE}${path.startsWith('/') ? path : `/${path}`}`, {
+    res = await fetch(`${API_BASE}${normalizedPath}`, {
       ...options,
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...(options.headers || {}),
       },
     });
@@ -28,6 +55,10 @@ export async function api(path, options = {}) {
     data = { error: text };
   }
   if (!res.ok) {
+    if (res.status === 401 && !normalizedPath.startsWith('/auth/') && unauthorizedHandler) {
+      setToken('');
+      unauthorizedHandler();
+    }
     throw new Error(data.error || `Request failed (${res.status})`);
   }
   return data;
