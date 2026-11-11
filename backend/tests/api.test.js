@@ -158,3 +158,79 @@ test('Vercel cron reminder endpoint enforces optional CRON_SECRET', async () => 
     await ctx.close();
   }
 });
+
+test('income sources CRUD, cashflow timing-gap vs sufficient analysis, and AI income queries', async () => {
+  const ctx = await startTestServer();
+  try {
+    // Debt due in 2 days for 20,000; starting cash = 5,000; business income arrives in 6 days for 35,000
+    await ctx.req('/api/cash', { method: 'PUT', body: JSON.stringify({ starting_cash: 5000 }) });
+    await ctx.req('/api/debts', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'Business Loan EMI',
+        category: 'PERSONAL_LOAN',
+        principal_amount: 100000,
+        remaining_balance: 80000,
+        interest_rate: 12,
+        minimum_payment: 20000,
+        next_due_date: offsetIso(2),
+        frequency: 'MONTHLY',
+      }),
+    });
+
+    const incRes = await ctx.req('/api/incomes', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'Wholesale Store Payout',
+        source_type: 'BUSINESS',
+        amount: 35000,
+        expected_date: offsetIso(6),
+        frequency: 'MONTHLY',
+      }),
+    });
+    assert.equal(incRes.status, 201);
+    const incId = incRes.body.income.id;
+
+    // Timing gap detected: total 30d money (5k + 35k = 40k) covers 20k, but 15k is missing on day 2 before day 6 payout
+    const cf1 = await ctx.req('/api/cashflow?days=30');
+    assert.equal(cf1.status, 200);
+    assert.equal(cf1.body.overall_status, 'ARRANGE_FUNDS');
+    assert.equal(cf1.body.timing_gap_only, true);
+    assert.equal(cf1.body.total_shortfall_to_arrange, 15000);
+    assert.equal(cf1.body.debt_checks[0].status, 'SHORTFALL');
+    assert.equal(cf1.body.debt_checks[0].gap_days, 4);
+
+    // AI answers sufficiency question accurately
+    const aiCheck = await ctx.req('/api/ai/chat', {
+      method: 'POST',
+      body: JSON.stringify({ message: 'Will my business income be sufficient or do I need to arrange money?' }),
+    });
+    assert.equal(aiCheck.status, 200);
+    assert.match(aiCheck.body.reply, /Arrange|Timing gap|15,000/i);
+
+    // Receive income early -> adds 35,000 to cash (40,000 total) and advances payout date
+    const rec = await ctx.req(`/api/incomes/${incId}/receive`, { method: 'POST', body: JSON.stringify({}) });
+    assert.equal(rec.status, 200);
+    assert.equal(rec.body.income.expected_date, advanceDueDate(offsetIso(6), 'MONTHLY'));
+
+    // Now cashflow is SUFFICIENT
+    const cf2 = await ctx.req('/api/cashflow?days=30');
+    assert.equal(cf2.body.overall_status, 'SUFFICIENT');
+    assert.equal(cf2.body.total_shortfall_to_arrange, 0);
+
+    // AI parses natural language business income
+    const aiAddInc = await ctx.req('/api/ai/chat', {
+      method: 'POST',
+      body: JSON.stringify({ message: 'Add ₹45000 Shop Revenue business income due on 2026-11-20' }),
+    });
+    assert.equal(aiAddInc.status, 200);
+    assert.ok(aiAddInc.body.created_income);
+    assert.equal(aiAddInc.body.created_income.amount, 45000);
+
+    // Delete income
+    const del = await ctx.req(`/api/incomes/${incId}`, { method: 'DELETE' });
+    assert.equal(del.status, 200);
+  } finally {
+    await ctx.close();
+  }
+});

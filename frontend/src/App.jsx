@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Archive,
+  ArrowUpDown,
   Bell,
   BellRing,
   CalendarClock,
@@ -20,6 +21,7 @@ import { api, formatMoney, urgencyMeta } from './api.js';
 import CalendarPanel from './components/CalendarPanel.jsx';
 import AiAssistantPanel from './components/AiAssistantPanel.jsx';
 import PayoffPlanner from './components/PayoffPlanner.jsx';
+import IncomeCashflowPanel from './components/IncomeCashflowPanel.jsx';
 
 const emptyDebtForm = {
   name: '',
@@ -175,7 +177,7 @@ export default function App() {
     return <div className="loading-screen">Loading DebtGuard AI…</div>;
   }
 
-  const { summary, debts, settings } = dashboard;
+  const { summary, debts, incomes = [], cashflow, settings } = dashboard;
   const currency = settings?.currency || 'INR';
   const filteredDebts = debts.filter((d) => (debtFilter === 'ALL' ? true : d.status === debtFilter));
   const urgentDebts = debts.filter((d) => d.status === 'ACTIVE' && (d.urgency === 'OVERDUE' || d.urgency === 'DUE_TODAY' || d.urgency === 'DUE_SOON'));
@@ -194,6 +196,7 @@ export default function App() {
         <nav className="top-nav">
           {[
             ['overview', 'Overview & Calendar', LayoutDashboard],
+            ['cashflow', 'Income & Cashflow', ArrowUpDown],
             ['debts', 'Debts & Payments', CreditCard],
             ['planner', 'Payoff Planner', TrendingDown],
             ['reminders', `Reminders${summary.unread_reminders_count ? ` (${summary.unread_reminders_count})` : ''}`, Bell],
@@ -235,6 +238,18 @@ export default function App() {
         </div>
       )}
 
+      {cashflow && (
+        <div className={`cashflow-banner ${cashflow.overall_status === 'ARRANGE_FUNDS' ? 'warn' : 'ok'}`}>
+          <div className="cashflow-banner-copy">
+            <strong>{cashflow.overall_status === 'ARRANGE_FUNDS' ? '⚠️ ' : '✅ '}{cashflow.headline}</strong>
+            <span>{cashflow.recommendation}</span>
+          </div>
+          <button type="button" className="secondary small" onClick={() => setTab('cashflow')}>
+            {incomes.length ? 'Check Cashflow Dates' : '+ Add Business Income'}
+          </button>
+        </div>
+      )}
+
       <div className="workspace-grid">
         <main className="main-col">
           {tab === 'overview' && (
@@ -246,24 +261,25 @@ export default function App() {
                   <small>{summary.active_count} active account(s)</small>
                 </div>
                 <div className="stat-card accent-emerald">
-                  <span>Monthly minimums</span>
-                  <strong>{formatMoney(summary.monthly_minimum_total, currency)}</strong>
-                  <small>{summary.paid_off_count} debt(s) paid off</small>
+                  <span>30d expected income</span>
+                  <strong>{formatMoney(summary.projected_30d_income || 0, currency)}</strong>
+                  <small>{incomes.filter((i) => i.status === 'ACTIVE').length} income source(s)</small>
                 </div>
                 <div className="stat-card accent-amber">
                   <span>Due within 7 days</span>
                   <strong>{summary.due_this_week_count}</strong>
                   <small>Next reminder check active</small>
                 </div>
-                <div className="stat-card accent-rose">
-                  <span>Overdue alerts</span>
-                  <strong>{summary.overdue_count}</strong>
-                  <small>{summary.unread_reminders_count} unread notification(s)</small>
+                <div className={`stat-card ${summary.shortfall_to_arrange > 0 ? 'accent-rose' : 'accent-emerald'}`}>
+                  <span>Need from outside</span>
+                  <strong>{formatMoney(summary.shortfall_to_arrange || 0, currency)}</strong>
+                  <small>{summary.shortfall_to_arrange > 0 ? 'Shortfall detected' : 'Covered by cash & income'}</small>
                 </div>
               </div>
 
               <CalendarPanel
                 debts={debts}
+                incomes={incomes}
                 currency={currency}
                 today={summary.today}
                 onPay={(debt) => setPayModal({ debt, amount: String(debt.minimum_payment || debt.remaining_balance), paid_on: summary.today, note: '' })}
@@ -309,6 +325,16 @@ export default function App() {
                 )}
               </section>
             </>
+          )}
+
+          {tab === 'cashflow' && (
+            <IncomeCashflowPanel
+              incomes={incomes}
+              startingCash={summary.starting_cash || 0}
+              currency={currency}
+              onChanged={loadAll}
+              onNotice={showNotice}
+            />
           )}
 
           {tab === 'debts' && (
@@ -459,7 +485,7 @@ export default function App() {
           )}
         </main>
 
-        <AiAssistantPanel onDebtCreated={loadAll} />
+        <AiAssistantPanel onDataChanged={loadAll} />
       </div>
 
       {formModal && (

@@ -33,7 +33,19 @@ async function seed() {
     );
   }
 
-  console.log(`Seeded ${samples.length} sample debts (${db.dialect}).`);
+  const incomeSamples = [
+    ['Retail Store Weekly Settlement', 'BUSINESS', 18000, offsetIsoDate(4), 'WEEKLY', 'CERTAIN', 'Weekly shop payout'],
+    ['Wholesale Client Retainer', 'BUSINESS', 35000, offsetIsoDate(10), 'MONTHLY', 'CERTAIN', 'Monthly B2B invoice'],
+  ];
+  for (const row of incomeSamples) {
+    await db.insert(
+      `INSERT INTO incomes (name, source_type, amount, expected_date, frequency, reliability, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      row
+    );
+  }
+
+  console.log(`Seeded ${samples.length} sample debts and ${incomeSamples.length} business income sources (${db.dialect}).`);
   await db.close();
 }
 

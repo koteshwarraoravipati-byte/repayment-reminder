@@ -59,6 +59,21 @@ CREATE TABLE IF NOT EXISTS reminder_settings (
   reminder_email TEXT NOT NULL DEFAULT '',
   preferred_strategy TEXT NOT NULL DEFAULT 'avalanche',
   currency TEXT NOT NULL DEFAULT 'INR',
+  starting_cash REAL NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS incomes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  source_type TEXT NOT NULL DEFAULT 'BUSINESS',
+  amount REAL NOT NULL,
+  expected_date TEXT NOT NULL,
+  frequency TEXT NOT NULL DEFAULT 'MONTHLY',
+  reliability TEXT NOT NULL DEFAULT 'CERTAIN',
+  status TEXT NOT NULL DEFAULT 'ACTIVE',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -71,6 +86,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 );
 
 CREATE INDEX IF NOT EXISTS ix_debts_status_due ON debts (status, next_due_date);
+CREATE INDEX IF NOT EXISTS ix_incomes_status_date ON incomes (status, expected_date);
 CREATE INDEX IF NOT EXISTS ix_payments_debt ON payments (debt_id);
 CREATE INDEX IF NOT EXISTS ix_reminders_status ON reminders (status);
 `;
@@ -125,6 +141,21 @@ CREATE TABLE IF NOT EXISTS reminder_settings (
   reminder_email VARCHAR(160) NOT NULL DEFAULT '',
   preferred_strategy VARCHAR(20) NOT NULL DEFAULT 'avalanche',
   currency VARCHAR(10) NOT NULL DEFAULT 'INR',
+  starting_cash DOUBLE PRECISION NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS incomes (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(160) NOT NULL,
+  source_type VARCHAR(40) NOT NULL DEFAULT 'BUSINESS',
+  amount DOUBLE PRECISION NOT NULL,
+  expected_date VARCHAR(10) NOT NULL,
+  frequency VARCHAR(20) NOT NULL DEFAULT 'MONTHLY',
+  reliability VARCHAR(20) NOT NULL DEFAULT 'CERTAIN',
+  status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -137,6 +168,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 );
 
 CREATE INDEX IF NOT EXISTS ix_debts_status_due ON debts (status, next_due_date);
+CREATE INDEX IF NOT EXISTS ix_incomes_status_date ON incomes (status, expected_date);
 CREATE INDEX IF NOT EXISTS ix_payments_debt ON payments (debt_id);
 CREATE INDEX IF NOT EXISTS ix_reminders_status ON reminders (status);
 `;
@@ -167,6 +199,7 @@ export function createDb(options = {}) {
         ssl: databaseUrl.includes('localhost') || databaseUrl.includes('127.0.0.1') ? false : { rejectUnauthorized: false },
       });
       await pgPool.query(POSTGRES_SCHEMA);
+      await pgPool.query('ALTER TABLE reminder_settings ADD COLUMN IF NOT EXISTS starting_cash DOUBLE PRECISION NOT NULL DEFAULT 0');
     } else {
       const dbPath = options.sqlitePath || process.env.SQLITE_PATH || (isVercelEphemeral ? '/tmp/debts.db' : DEFAULT_SQLITE_PATH);
       if (dbPath !== ':memory:') {
@@ -174,6 +207,10 @@ export function createDb(options = {}) {
       }
       sqliteDb = new DatabaseSync(dbPath);
       sqliteDb.exec(SQLITE_SCHEMA);
+      const cols = sqliteDb.prepare('PRAGMA table_info(reminder_settings)').all().map((c) => c.name);
+      if (!cols.includes('starting_cash')) {
+        sqliteDb.exec('ALTER TABLE reminder_settings ADD COLUMN starting_cash REAL NOT NULL DEFAULT 0');
+      }
     }
 
     await execute(

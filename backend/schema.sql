@@ -49,6 +49,21 @@ CREATE TABLE IF NOT EXISTS reminder_settings (
   reminder_email VARCHAR(160) NOT NULL DEFAULT '',
   preferred_strategy VARCHAR(20) NOT NULL DEFAULT 'avalanche',
   currency VARCHAR(10) NOT NULL DEFAULT 'INR',
+  starting_cash DOUBLE PRECISION NOT NULL DEFAULT 0,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS incomes (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(160) NOT NULL,
+  source_type VARCHAR(40) NOT NULL DEFAULT 'BUSINESS',
+  amount DOUBLE PRECISION NOT NULL,
+  expected_date VARCHAR(10) NOT NULL,
+  frequency VARCHAR(20) NOT NULL DEFAULT 'MONTHLY',
+  reliability VARCHAR(20) NOT NULL DEFAULT 'CERTAIN',
+  status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -61,5 +76,6 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 );
 
 CREATE INDEX IF NOT EXISTS ix_debts_status_due ON debts (status, next_due_date);
+CREATE INDEX IF NOT EXISTS ix_incomes_status_date ON incomes (status, expected_date);
 CREATE INDEX IF NOT EXISTS ix_payments_debt ON payments (debt_id);
 CREATE INDEX IF NOT EXISTS ix_reminders_status ON reminders (status);

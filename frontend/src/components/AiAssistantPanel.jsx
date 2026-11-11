@@ -3,13 +3,14 @@ import { Bot, Send, Sparkles, Trash2 } from 'lucide-react';
 import { api } from '../api.js';
 
 const QUICK_PROMPTS = [
+  'Will my money be sufficient this month?',
   "What's due this week?",
   'Which debt should I pay first?',
-  'Compare Snowball vs Avalanche with ₹3000 extra',
-  'Add a ₹25000 Visa Card at 24% interest due on the 18th',
+  'Add ₹45000 Shop Business income on the 18th',
 ];
 
-export default function AiAssistantPanel({ onDebtCreated }) {
+export default function AiAssistantPanel({ onDataChanged, onDebtCreated }) {
+  const onChange = onDataChanged || onDebtCreated;
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
@@ -42,8 +43,8 @@ export default function AiAssistantPanel({ onDebtCreated }) {
         ...prev,
         { id: `ai-${Date.now()}`, role: 'assistant', content: res.reply, provider: res.provider },
       ]);
-      if (res.created_debt && onDebtCreated) {
-        onDebtCreated();
+      if ((res.created_debt || res.created_income) && onChange) {
+        onChange();
       }
     } catch (err) {
       setError(err.message);

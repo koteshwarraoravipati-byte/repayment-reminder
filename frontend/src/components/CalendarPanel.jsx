@@ -4,7 +4,7 @@ import { formatMoney, urgencyMeta } from '../api.js';
 
 const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-export default function CalendarPanel({ debts, currency, today, onPay }) {
+export default function CalendarPanel({ debts = [], incomes = [], currency, today, onPay }) {
   const [cursor, setCursor] = useState(() => {
     const [y, m] = (today || new Date().toISOString().slice(0, 10)).split('-').map(Number);
     return { year: y, month: m - 1 };
@@ -26,6 +26,16 @@ export default function CalendarPanel({ debts, currency, today, onPay }) {
     return map;
   }, [debts]);
 
+  const incomesByDate = useMemo(() => {
+    const map = {};
+    for (const inc of incomes) {
+      if (inc.status !== 'ACTIVE') continue;
+      if (!map[inc.expected_date]) map[inc.expected_date] = [];
+      map[inc.expected_date].push(inc);
+    }
+    return map;
+  }, [incomes]);
+
   const cells = useMemo(() => {
     const firstDay = new Date(Date.UTC(cursor.year, cursor.month, 1)).getUTCDay();
     const daysInMonth = new Date(Date.UTC(cursor.year, cursor.month + 1, 0)).getUTCDate();
@@ -33,10 +43,10 @@ export default function CalendarPanel({ debts, currency, today, onPay }) {
     for (let i = 0; i < firstDay; i++) list.push(null);
     for (let day = 1; day <= daysInMonth; day++) {
       const iso = `${cursor.year}-${String(cursor.month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-      list.push({ day, iso, items: debtsByDate[iso] || [] });
+      list.push({ day, iso, items: debtsByDate[iso] || [], incomeItems: incomesByDate[iso] || [] });
     }
     return list;
-  }, [cursor, debtsByDate]);
+  }, [cursor, debtsByDate, incomesByDate]);
 
   const shiftMonth = (delta) => {
     setCursor((prev) => {
@@ -46,13 +56,14 @@ export default function CalendarPanel({ debts, currency, today, onPay }) {
   };
 
   const selectedItems = debtsByDate[selectedDay] || [];
+  const selectedIncomes = incomesByDate[selectedDay] || [];
 
   return (
     <section className="panel">
       <div className="panel-head">
         <div>
-          <p className="eyebrow">REPAYMENT SCHEDULE</p>
-          <h2><CalendarIcon size={18} /> Due-date calendar</h2>
+          <p className="eyebrow">INCOME &amp; REPAYMENT SCHEDULE</p>
+          <h2><CalendarIcon size={18} /> Cashflow calendar</h2>
         </div>
         <div className="cal-nav">
           <button type="button" className="icon-btn" onClick={() => shiftMonth(-1)} aria-label="Previous month"><ChevronLeft size={16} /></button>
@@ -67,6 +78,7 @@ export default function CalendarPanel({ debts, currency, today, onPay }) {
           if (!cell) return <div key={`empty-${idx}`} className="cal-cell empty" />;
           const isToday = cell.iso === today;
           const isSelected = cell.iso === selectedDay;
+          const combinedCount = cell.incomeItems.length + cell.items.length;
           return (
             <button
               type="button"
@@ -76,11 +88,16 @@ export default function CalendarPanel({ debts, currency, today, onPay }) {
             >
               <span className="cal-day">{cell.day}</span>
               <div className="cal-dots">
-                {cell.items.slice(0, 3).map((d) => {
+                {cell.incomeItems.slice(0, 2).map((inc) => (
+                  <span key={`inc-${inc.id}`} className="cal-pill badge-success" title={`Income: ${inc.name} (+${formatMoney(inc.amount, currency)})`}>
+                    +{inc.name}
+                  </span>
+                ))}
+                {cell.items.slice(0, 2).map((d) => {
                   const meta = urgencyMeta(d.urgency, d.days_until_due);
-                  return <span key={d.id} className={`cal-pill ${meta.cls}`} title={`${d.name} (${formatMoney(d.minimum_payment, currency)})`}>{d.name}</span>;
+                  return <span key={`debt-${d.id}`} className={`cal-pill ${meta.cls}`} title={`Due: ${d.name} (${formatMoney(d.minimum_payment, currency)})`}>{d.name}</span>;
                 })}
-                {cell.items.length > 3 && <span className="cal-more">+{cell.items.length - 3}</span>}
+                {combinedCount > 4 && <span className="cal-more">+{combinedCount - 4}</span>}
               </div>
             </button>
           );
@@ -90,12 +107,21 @@ export default function CalendarPanel({ debts, currency, today, onPay }) {
       <div className="cal-detail">
         <div className="cal-detail-head">
           <strong>Scheduled for {selectedDay}</strong>
-          <span>{selectedItems.length} {selectedItems.length === 1 ? 'debt' : 'debts'}</span>
+          <span>{selectedIncomes.length} income · {selectedItems.length} {selectedItems.length === 1 ? 'debt' : 'debts'}</span>
         </div>
-        {!selectedItems.length ? (
-          <p className="muted small-note">No payments due on this date. Select a highlighted date to inspect or record a payment.</p>
+        {!selectedItems.length && !selectedIncomes.length ? (
+          <p className="muted small-note">No income payouts or debt due dates on this date. Select a highlighted date to inspect.</p>
         ) : (
           <div className="cal-list">
+            {selectedIncomes.map((inc) => (
+              <div key={`inc-detail-${inc.id}`} className="cal-item cal-item-income">
+                <div>
+                  <strong>+ {inc.name}</strong>
+                  <small>{inc.source_type} · Expected payout · {inc.frequency.toLowerCase()}</small>
+                </div>
+                <span className="badge badge-success">+{formatMoney(inc.amount, currency)}</span>
+              </div>
+            ))}
             {selectedItems.map((d) => {
               const meta = urgencyMeta(d.urgency, d.days_until_due);
               return (
