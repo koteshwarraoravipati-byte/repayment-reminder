@@ -138,3 +138,23 @@ test('AI chat parses natural language debt entry and answers due date queries', 
     await ctx.close();
   }
 });
+
+test('Vercel cron reminder endpoint enforces optional CRON_SECRET', async () => {
+  const ctx = await startTestServer();
+  const prevSecret = process.env.CRON_SECRET;
+  try {
+    process.env.CRON_SECRET = 'top-secret-cron';
+    const unauth = await ctx.req('/api/cron/reminders');
+    assert.equal(unauth.status, 401);
+
+    const auth = await ctx.req('/api/cron/reminders', {
+      headers: { Authorization: 'Bearer top-secret-cron' },
+    });
+    assert.equal(auth.status, 200);
+    assert.equal(auth.body.ok, true);
+  } finally {
+    if (prevSecret === undefined) delete process.env.CRON_SECRET;
+    else process.env.CRON_SECRET = prevSecret;
+    await ctx.close();
+  }
+});

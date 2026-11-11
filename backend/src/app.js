@@ -66,7 +66,7 @@ export function createApp(db, options = {}) {
   app.get('/api/health', async (_req, res, next) => {
     try {
       await db.queryOne('SELECT 1 AS ok');
-      res.json({ status: 'ok', service: 'debt-repayment-assistant', database: db.dialect });
+      res.json({ status: 'ok', service: 'debt-repayment-assistant', database: db.dialect, persistence: db.persistence });
     } catch (err) {
       next(err);
     }
@@ -343,6 +343,19 @@ export function createApp(db, options = {}) {
     try {
       const report = await runReminderSweep(db);
       res.json(report);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/cron/reminders', async (req, res, next) => {
+    try {
+      const secret = (process.env.CRON_SECRET || '').trim();
+      if (secret && req.headers.authorization !== `Bearer ${secret}`) {
+        return res.status(401).json({ error: 'Unauthorized cron request' });
+      }
+      const report = await runReminderSweep(db);
+      res.json({ ok: true, ...report });
     } catch (err) {
       next(err);
     }

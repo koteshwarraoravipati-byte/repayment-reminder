@@ -88,6 +88,8 @@ function toSqliteQuery(sql, params = []) {
 export function createDb(options = {}) {
   const databaseUrl = (options.databaseUrl ?? process.env.DATABASE_URL ?? '').trim();
   const isPostgres = databaseUrl.startsWith('postgres://') || databaseUrl.startsWith('postgresql://');
+  const isVercelEphemeral = !isPostgres && !options.sqlitePath && Boolean(process.env.VERCEL);
+  const persistence = isPostgres ? 'postgres' : isVercelEphemeral ? 'ephemeral-tmp' : 'sqlite-file';
 
   let sqliteDb = null;
   let pgPool = null;
@@ -101,7 +103,7 @@ export function createDb(options = {}) {
       const schemaSql = fs.readFileSync(path.resolve(__dirname, '../schema.sql'), 'utf8');
       await pgPool.query(schemaSql);
     } else {
-      const dbPath = options.sqlitePath || process.env.SQLITE_PATH || DEFAULT_SQLITE_PATH;
+      const dbPath = options.sqlitePath || process.env.SQLITE_PATH || (isVercelEphemeral ? '/tmp/debts.db' : DEFAULT_SQLITE_PATH);
       if (dbPath !== ':memory:') {
         fs.mkdirSync(path.dirname(dbPath), { recursive: true });
       }
@@ -157,5 +159,5 @@ export function createDb(options = {}) {
     if (sqliteDb) sqliteDb.close();
   }
 
-  return { init, query, queryOne, execute, insert, close, dialect: isPostgres ? 'postgres' : 'sqlite' };
+  return { init, query, queryOne, execute, insert, close, dialect: isPostgres ? 'postgres' : 'sqlite', persistence };
 }
