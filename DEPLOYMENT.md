@@ -7,9 +7,10 @@
    - *(Optional)* You can run `backend/schema.sql` manually, or let `backend/api/index.js` create the tables automatically on its first request.
 
 2. **Deploy Backend on Vercel:**
-   - Import `koteshwarraoravipati-byte/REPAYMENT-REMINDER` in Vercel with **Root Directory** = `backend`.
+   - Import `koteshwarraoravipati-byte/repayment-reminder` in Vercel with **Root Directory** = `backend`.
    - Set environment variables:
      - `DATABASE_URL` = your PostgreSQL connection string
+     - `JWT_SECRET` = strong random secret for JWT session tokens & OTP hashing
      - `CORS_ORIGIN` = your deployed frontend URL (e.g. `https://repayment-reminder.vercel.app`)
      - *(Optional)* `GEMINI_API_KEY` or `OPENAI_API_KEY` for LLM chat
      - *(Optional)* `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` for email reminders

@@ -5,7 +5,7 @@ Full-stack debt repayment, business income vs. cashflow sufficiency, and automat
 ## Live deployment
 - Frontend: https://repayment-reminder.vercel.app/
 - API health: https://repayment-reminder-api.vercel.app/api/health
-- Source repository: https://github.com/koteshwarraoravipati-byte/REPAYMENT-REMINDER
+- Source repository: https://github.com/koteshwarraoravipati-byte/repayment-reminder
 
 ## Stack
 - **Frontend:** React + Vite dashboard, authentication screens (Sign In / Create Account / OTP Forgot Password), interactive due-date calendar, payoff planner, browser `Notification` alerts, and AI Copilot panel
