@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .env
+.vercel
 backend/data/*.db
 backend/data/*.db-journal
 *.log
