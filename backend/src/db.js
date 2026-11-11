@@ -75,6 +75,72 @@ CREATE INDEX IF NOT EXISTS ix_payments_debt ON payments (debt_id);
 CREATE INDEX IF NOT EXISTS ix_reminders_status ON reminders (status);
 `;
 
+const POSTGRES_SCHEMA = `
+CREATE TABLE IF NOT EXISTS debts (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(160) NOT NULL,
+  lender VARCHAR(160) NOT NULL DEFAULT '',
+  category VARCHAR(60) NOT NULL DEFAULT 'LOAN',
+  principal_amount DOUBLE PRECISION NOT NULL,
+  remaining_balance DOUBLE PRECISION NOT NULL,
+  interest_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+  minimum_payment DOUBLE PRECISION NOT NULL DEFAULT 0,
+  next_due_date VARCHAR(10) NOT NULL,
+  frequency VARCHAR(20) NOT NULL DEFAULT 'MONTHLY',
+  auto_pay BOOLEAN NOT NULL DEFAULT FALSE,
+  status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+  notes TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+  id SERIAL PRIMARY KEY,
+  debt_id INTEGER NOT NULL REFERENCES debts(id) ON DELETE CASCADE,
+  amount DOUBLE PRECISION NOT NULL,
+  paid_on VARCHAR(10) NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS reminders (
+  id SERIAL PRIMARY KEY,
+  debt_id INTEGER NOT NULL REFERENCES debts(id) ON DELETE CASCADE,
+  due_date VARCHAR(10) NOT NULL,
+  days_before INTEGER NOT NULL,
+  channel VARCHAR(30) NOT NULL DEFAULT 'IN_APP',
+  title VARCHAR(200) NOT NULL,
+  message TEXT NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'UNREAD',
+  sent_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (debt_id, due_date, days_before)
+);
+
+CREATE TABLE IF NOT EXISTS reminder_settings (
+  id INTEGER PRIMARY KEY,
+  lead_days VARCHAR(60) NOT NULL DEFAULT '7,3,1,0',
+  daily_cron VARCHAR(40) NOT NULL DEFAULT '0 9 * * *',
+  browser_notifications BOOLEAN NOT NULL DEFAULT TRUE,
+  email_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  reminder_email VARCHAR(160) NOT NULL DEFAULT '',
+  preferred_strategy VARCHAR(20) NOT NULL DEFAULT 'avalanche',
+  currency VARCHAR(10) NOT NULL DEFAULT 'INR',
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id SERIAL PRIMARY KEY,
+  role VARCHAR(20) NOT NULL,
+  content TEXT NOT NULL,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS ix_debts_status_due ON debts (status, next_due_date);
+CREATE INDEX IF NOT EXISTS ix_payments_debt ON payments (debt_id);
+CREATE INDEX IF NOT EXISTS ix_reminders_status ON reminders (status);
+`;
+
 function toSqliteQuery(sql, params = []) {
   const ordered = [];
   const translated = sql.replace(/\$(\d+)/g, (_, idx) => {
@@ -100,8 +166,7 @@ export function createDb(options = {}) {
         connectionString: databaseUrl,
         ssl: databaseUrl.includes('localhost') || databaseUrl.includes('127.0.0.1') ? false : { rejectUnauthorized: false },
       });
-      const schemaSql = fs.readFileSync(path.resolve(__dirname, '../schema.sql'), 'utf8');
-      await pgPool.query(schemaSql);
+      await pgPool.query(POSTGRES_SCHEMA);
     } else {
       const dbPath = options.sqlitePath || process.env.SQLITE_PATH || (isVercelEphemeral ? '/tmp/debts.db' : DEFAULT_SQLITE_PATH);
       if (dbPath !== ':memory:') {
